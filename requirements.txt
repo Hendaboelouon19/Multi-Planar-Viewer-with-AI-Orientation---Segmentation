@@ -1,0 +1,15 @@
+# Core environment
+numpy
+PySide6
+SimpleITK
+nibabel
+
+# PyTorch (AI Framework)
+# Default = CPU build; for GPU use the CUDA 12.1 wheel (see README)
+torch
+torchvision
+torchaudio
+
+# Optional utilities
+matplotlib
+scipy
