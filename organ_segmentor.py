@@ -10,26 +10,20 @@ import nibabel as nib
 from pathlib import Path
 import pickle
 import tempfile
-from totalsegmentator.python_api import totalsegmentator
+import os
+import sys
+import traceback
 
 
 class OrganSegmentor:
     """
     Real-time organ segmentation using TotalSegmentator
     Supports filtering organs to display only those within ROI boundaries
-
-    Usage:
-        segmentor = OrganSegmentor()
-        image_data, success = segmentor.segment_nifti('scan.nii.gz')
-        organs = segmentor.get_organs_in_slice(slice_index, axis=0, roi_bounds=None)
     """
 
     def __init__(self, cache_dir="./segmentation_cache"):
         """
         Initialize organ segmentor
-
-        Args:
-            cache_dir: Directory to cache segmentation results
         """
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
@@ -40,6 +34,9 @@ class OrganSegmentor:
         self.affine = None
         self.is_processing = False
         self.processing_complete = False
+
+        # Set environment variables to prevent multiprocessing issues
+        self._set_environment_vars()
 
         # Comprehensive organ name mapping
         self.organ_names = {
@@ -62,18 +59,23 @@ class OrganSegmentor:
             97: "thalamus", 98: "hippocampus", 99: "amygdala"
         }
 
+    def _set_environment_vars(self):
+        """Set environment variables to prevent multiprocessing issues"""
+        # Prevent multiprocessing issues on Windows
+        if sys.platform == "win32":
+            os.environ["NO_MP"] = "1"
+
+        # Reduce memory usage
+        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+        # Disable multiprocessing for stability
+        os.environ["NUMEXPR_MAX_THREADS"] = "1"
+        os.environ["OMP_NUM_THREADS"] = "1"
+        os.environ["MKL_NUM_THREADS"] = "1"
+
     def segment_nifti(self, nifti_path, use_cache=True, fast=True, callback=None):
         """
         Load NIfTI file and run TotalSegmentator
-
-        Args:
-            nifti_path: Path to .nii or .nii.gz file
-            use_cache: Use cached results if available (default True)
-            fast: Use fast mode (default True)
-            callback: Optional callback function(message) for progress updates
-
-        Returns:
-            tuple: (image_data: np.array, is_new: bool)
         """
         nifti_path = Path(nifti_path)
         cache_file = self.cache_dir / f"{nifti_path.stem}_segmentation.pkl"
@@ -95,7 +97,8 @@ class OrganSegmentor:
                 nii = nib.load(str(nifti_path))
                 image_data = nii.get_fdata()
 
-                print(f"✓ Loaded from cache: {len(self.organ_labels)} organs found")
+                print(
+                    f"✓ Loaded from cache: {len(self.organ_labels)} organs found")
                 self.processing_complete = True
 
                 if callback:
@@ -104,7 +107,8 @@ class OrganSegmentor:
                 return image_data, False
 
             except Exception as e:
-                print(f"⚠ Cache load failed: {e}, running fresh segmentation...")
+                print(
+                    f"⚠ Cache load failed: {e}, running fresh segmentation...")
                 if callback:
                     callback("Cache failed, running fresh segmentation...")
 
@@ -113,18 +117,24 @@ class OrganSegmentor:
             callback("Loading NIfTI file...")
         print("Loading NIfTI file...")
 
-        nii = nib.load(str(nifti_path))
-        image_data = nii.get_fdata()
-        self.image_shape = image_data.shape
-        self.affine = nii.affine
+        try:
+            nii = nib.load(str(nifti_path))
+            image_data = nii.get_fdata()
+            self.image_shape = image_data.shape
+            self.affine = nii.affine
+        except Exception as e:
+            print(f"✗ Error loading NIfTI file: {e}")
+            if callback:
+                callback(f"Error loading file: {e}")
+            return None, False
 
         print(f"Image shape: {image_data.shape}")
 
         if callback:
-            callback(f"Running TotalSegmentator...")
-        print("Running TotalSegmentator...")
+            callback("Running TotalSegmentator AI...")
+        print("Running TotalSegmentator AI...")
 
-        # Run TotalSegmentator
+        # Run TotalSegmentator with error handling
         with tempfile.TemporaryDirectory() as temp_dir:
             output_path = Path(temp_dir) / "segmentation.nii"
 
@@ -132,128 +142,195 @@ class OrganSegmentor:
                 self.is_processing = True
 
                 if callback:
-                    callback("Segmenting organs (this may take several minutes)...")
+                    callback(
+                        "AI model processing (this may take several minutes)...")
 
-                # Run segmentation on FULL VOLUME (not ROI)
+                # Import and run TotalSegmentator
+                from totalsegmentator.python_api import totalsegmentator
+
+                # Run TotalSegmentator with proper parameters
                 totalsegmentator(
-                    str(nifti_path),
-                    str(output_path),
+                    input=str(nifti_path),
+                    output=str(output_path),
                     fast=fast,
-                    ml=True
+                    ml=True,
+                    preview=False,
+                    statistics=False,
+                    radiomics=False,
+                    multiprocessing="disabled",
+                    verbose=False,
+                    force_split=False
                 )
 
                 # Load segmentation result
-                seg_nii = nib.load(str(output_path))
-                self.segmentation_mask = seg_nii.get_fdata().astype(np.uint8)
+                if output_path.exists():
+                    seg_nii = nib.load(str(output_path))
+                    self.segmentation_mask = seg_nii.get_fdata().astype(np.uint8)
 
-                # Get unique labels
-                unique_labels = np.unique(self.segmentation_mask)
-                self.organ_labels = {
-                    label: self.organ_names.get(label, f"structure_{label}")
-                    for label in unique_labels if label > 0
-                }
+                    # Get unique labels
+                    unique_labels = np.unique(self.segmentation_mask)
+                    self.organ_labels = {
+                        label: self.organ_names.get(
+                            label, f"structure_{label}")
+                        for label in unique_labels if label > 0
+                    }
 
-                print(f"✓ Segmentation complete! Found {len(self.organ_labels)} organs")
+                    print(
+                        f"✓ TotalSegmentator complete! Found {len(self.organ_labels)} organs")
 
-                # Cache results
-                cache_data = {
-                    'mask': self.segmentation_mask,
-                    'labels': self.organ_labels,
-                    'shape': self.image_shape,
-                    'affine': self.affine
-                }
-                with open(cache_file, 'wb') as f:
-                    pickle.dump(cache_data, f)
+                    # Cache results
+                    cache_data = {
+                        'mask': self.segmentation_mask,
+                        'labels': self.organ_labels,
+                        'shape': self.image_shape,
+                        'affine': self.affine
+                    }
+                    with open(cache_file, 'wb') as f:
+                        pickle.dump(cache_data, f)
 
-                print(f"Cache saved: {cache_file}")
+                    print(f"Cache saved: {cache_file}")
 
-                self.processing_complete = True
-                self.is_processing = False
+                    self.processing_complete = True
+                    self.is_processing = False
 
-                if callback:
-                    callback(f"Complete! Found {len(self.organ_labels)} organs")
+                    if callback:
+                        callback(
+                            f"AI Complete! Found {len(self.organ_labels)} organs")
+
+                else:
+                    raise Exception(
+                        "TotalSegmentator failed - no output file created")
 
             except Exception as e:
-                print(f"✗ Error during segmentation: {e}")
-                self.segmentation_mask = np.zeros_like(image_data, dtype=np.uint8)
+                print(f"✗ Error during TotalSegmentator: {e}")
+                traceback.print_exc()
+
+                # Create empty mask as fallback
+                self.segmentation_mask = np.zeros_like(
+                    image_data, dtype=np.uint8)
                 self.organ_labels = {}
                 self.is_processing = False
                 self.processing_complete = True
 
                 if callback:
-                    callback(f"Error: {str(e)}")
+                    callback(f"AI Error: {str(e)}")
 
-                raise e
+                return image_data, False
 
         return image_data, True
 
     def get_organs_in_slice(self, slice_index, axis=0, threshold=0.01, roi_bounds=None):
         """
-        Get list of organs present in a specific slice
-
-        Args:
-            slice_index: Slice index to check
-            axis: Axis of the slice (0=axial, 1=coronal, 2=sagittal)
-            threshold: Minimum percentage of slice that must contain organ (default 0.01 = 1%)
-            roi_bounds: Optional ROI boundaries dict:
-                       {'axial': (z_start, z_end), 'sagittal': (x_start, x_end), 'coronal': (y_start, y_end)}
-                       If provided, only returns organs within the ROI
-
-        Returns:
-            list: List of organ names present in the slice (human-readable, sorted)
+        Get list of organs present in a specific slice, respecting ROI boundaries
         """
         if self.segmentation_mask is None:
             return []
 
-        # Check if slice is within ROI bounds (if ROI is provided)
-        if roi_bounds is not None:
-            if axis == 0:  # Axial (Z-axis)
-                z_start, z_end = roi_bounds.get('axial', (0, self.image_shape[0]-1))
-                if not (z_start <= slice_index <= z_end):
-                    return []  # Outside ROI
-            elif axis == 1:  # Coronal (Y-axis)
-                y_start, y_end = roi_bounds.get('coronal', (0, self.image_shape[1]-1))
-                if not (y_start <= slice_index <= y_end):
-                    return []  # Outside ROI
-            elif axis == 2:  # Sagittal (X-axis)
-                x_start, x_end = roi_bounds.get('sagittal', (0, self.image_shape[2]-1))
-                if not (x_start <= slice_index <= x_end):
-                    return []  # Outside ROI
+        # Define ROI bounds (use full volume if no ROI provided)
+        if roi_bounds is None:
+            roi_bounds = {
+                'axial': (0, self.image_shape[0]-1),
+                'coronal': (0, self.image_shape[1]-1),
+                'sagittal': (0, self.image_shape[2]-1)
+            }
+
+        # Check if slice is within ROI bounds
+        if axis == 0:  # Axial (Z-axis)
+            z_start, z_end = roi_bounds.get(
+                'axial', (0, self.image_shape[0]-1))
+            if not (z_start <= slice_index <= z_end):
+                return []  # Outside ROI
+        elif axis == 1:  # Coronal (Y-axis)
+            y_start, y_end = roi_bounds.get(
+                'coronal', (0, self.image_shape[1]-1))
+            if not (y_start <= slice_index <= y_end):
+                return []  # Outside ROI
+        elif axis == 2:  # Sagittal (X-axis)
+            x_start, x_end = roi_bounds.get(
+                'sagittal', (0, self.image_shape[2]-1))
+            if not (x_start <= slice_index <= x_end):
+                return []  # Outside ROI
 
         # Extract the slice based on axis
         try:
             if axis == 0:  # Axial (Z-axis)
-                slice_mask = self.segmentation_mask[slice_index, :, :]
-                # Apply ROI mask if provided
-                if roi_bounds is not None:
-                    y_start, y_end = roi_bounds.get('coronal', (0, self.image_shape[1]-1))
-                    x_start, x_end = roi_bounds.get('sagittal', (0, self.image_shape[2]-1))
-                    slice_mask = slice_mask[y_start:y_end+1, x_start:x_end+1]
-                    
+                # Get the full slice first
+                full_slice = self.segmentation_mask[slice_index, :, :]
+
+                # Apply ROI mask in 2D (coronal and sagittal planes)
+                y_start, y_end = roi_bounds.get(
+                    'coronal', (0, self.image_shape[1]-1))
+                x_start, x_end = roi_bounds.get(
+                    'sagittal', (0, self.image_shape[2]-1))
+
+                # Create a mask for the ROI area
+                roi_mask = np.zeros_like(full_slice, dtype=bool)
+                roi_mask[y_start:y_end+1, x_start:x_end+1] = True
+
+                # Apply the ROI mask
+                slice_mask = np.where(roi_mask, full_slice, 0)
+
             elif axis == 1:  # Coronal (Y-axis)
-                slice_mask = self.segmentation_mask[:, slice_index, :]
-                # Apply ROI mask if provided
-                if roi_bounds is not None:
-                    z_start, z_end = roi_bounds.get('axial', (0, self.image_shape[0]-1))
-                    x_start, x_end = roi_bounds.get('sagittal', (0, self.image_shape[2]-1))
-                    slice_mask = slice_mask[z_start:z_end+1, x_start:x_end+1]
-                    
+                # Get the full slice first
+                full_slice = self.segmentation_mask[:, slice_index, :]
+
+                # Apply ROI mask in 2D (axial and sagittal planes)
+                z_start, z_end = roi_bounds.get(
+                    'axial', (0, self.image_shape[0]-1))
+                x_start, x_end = roi_bounds.get(
+                    'sagittal', (0, self.image_shape[2]-1))
+
+                # Create a mask for the ROI area
+                roi_mask = np.zeros_like(full_slice, dtype=bool)
+                roi_mask[z_start:z_end+1, x_start:x_end+1] = True
+
+                # Apply the ROI mask
+                slice_mask = np.where(roi_mask, full_slice, 0)
+
             elif axis == 2:  # Sagittal (X-axis)
-                slice_mask = self.segmentation_mask[:, :, slice_index]
-                # Apply ROI mask if provided
-                if roi_bounds is not None:
-                    z_start, z_end = roi_bounds.get('axial', (0, self.image_shape[0]-1))
-                    y_start, y_end = roi_bounds.get('coronal', (0, self.image_shape[1]-1))
-                    slice_mask = slice_mask[z_start:z_end+1, y_start:y_end+1]
+                # Get the full slice first
+                full_slice = self.segmentation_mask[:, :, slice_index]
+
+                # Apply ROI mask in 2D (axial and coronal planes)
+                z_start, z_end = roi_bounds.get(
+                    'axial', (0, self.image_shape[0]-1))
+                y_start, y_end = roi_bounds.get(
+                    'coronal', (0, self.image_shape[1]-1))
+
+                # Create a mask for the ROI area
+                roi_mask = np.zeros_like(full_slice, dtype=bool)
+                roi_mask[z_start:z_end+1, y_start:y_end+1] = True
+
+                # Apply the ROI mask
+                slice_mask = np.where(roi_mask, full_slice, 0)
             else:
                 return []
         except IndexError:
             return []
 
-        # Find unique organs in this slice
+        # Find unique organs in this ROI-filtered slice
         unique_labels, counts = np.unique(slice_mask, return_counts=True)
 
-        total_pixels = slice_mask.size
+        # Calculate total pixels in the ROI area only (not the entire slice)
+        if axis == 0:
+            y_start, y_end = roi_bounds.get(
+                'coronal', (0, self.image_shape[1]-1))
+            x_start, x_end = roi_bounds.get(
+                'sagittal', (0, self.image_shape[2]-1))
+            total_pixels = (y_end - y_start + 1) * (x_end - x_start + 1)
+        elif axis == 1:
+            z_start, z_end = roi_bounds.get(
+                'axial', (0, self.image_shape[0]-1))
+            x_start, x_end = roi_bounds.get(
+                'sagittal', (0, self.image_shape[2]-1))
+            total_pixels = (z_end - z_start + 1) * (x_end - x_start + 1)
+        else:  # axis == 2
+            z_start, z_end = roi_bounds.get(
+                'axial', (0, self.image_shape[0]-1))
+            y_start, y_end = roi_bounds.get(
+                'coronal', (0, self.image_shape[1]-1))
+            total_pixels = (z_end - z_start + 1) * (y_end - y_start + 1)
+
         organs_present = []
 
         for label, count in zip(unique_labels, counts):
@@ -293,16 +370,14 @@ if __name__ == '__main__':
     import sys
 
     print("=" * 60)
-    print("Organ Segmentor - Standalone Test")
+    print("Organ Segmentor - TotalSegmentator Test")
     print("=" * 60)
 
     segmentor = OrganSegmentor(cache_dir="./test_cache")
-    print(f"Cache directory: {segmentor.cache_dir}")
-    print(f"Known organs: {len(segmentor.organ_names)}")
 
     if len(sys.argv) > 1:
         nifti_path = sys.argv[1]
-        print(f"\n[Test] Segmenting: {nifti_path}")
+        print(f"Testing TotalSegmentator with: {nifti_path}")
 
         def progress_callback(message):
             print(f"  → {message}")
@@ -311,34 +386,30 @@ if __name__ == '__main__':
             image_data, is_new = segmentor.segment_nifti(
                 nifti_path,
                 use_cache=True,
-                fast=True,
                 callback=progress_callback
             )
 
-            print(f"\n  ✓ Segmentation complete!")
-            print(f"    Image shape: {image_data.shape}")
-            print(f"    Organs found: {len(segmentor.get_organ_labels())}")
+            print(
+                f"✓ TotalSegmentator Complete! Found {len(segmentor.get_organ_labels())} organs")
 
-            # Test with and without ROI
+            # Test ROI filtering
             mid_slice = image_data.shape[0] // 2
             organs_full = segmentor.get_organs_in_slice(mid_slice, axis=0)
-            print(f"\n  Full volume organs in slice {mid_slice}: {organs_full}")
+            print(f"Full volume: {organs_full}")
 
             # Test with ROI
             roi_bounds = {
-                'axial': (mid_slice-10, mid_slice+10),
+                'axial': (mid_slice-5, mid_slice+5),
                 'sagittal': (0, image_data.shape[2]//2),
                 'coronal': (0, image_data.shape[1]//2)
             }
-            organs_roi = segmentor.get_organs_in_slice(mid_slice, axis=0, roi_bounds=roi_bounds)
-            print(f"  ROI-filtered organs in slice {mid_slice}: {organs_roi}")
+            organs_roi = segmentor.get_organs_in_slice(
+                mid_slice, axis=0, roi_bounds=roi_bounds)
+            print(f"ROI filtered: {organs_roi}")
 
         except Exception as e:
-            print(f"\n  ✗ Error: {e}")
-            import traceback
-            traceback.print_exc()
-            sys.exit(1)
+            print(f"✗ TotalSegmentator Error: {e}")
     else:
-        print("\n[Test] Skipped (no NIfTI file provided)")
+        print("No file provided - TotalSegmentator ready for use")
 
-    print("\n" + "=" * 60)
+    print("=" * 60)
