@@ -268,7 +268,7 @@ def run_segmentation(self):
     self.segmentation_thread = SegmentationThreadROI(
         self.organ_segmentor,
         self.current_nifti_path,
-        roi_bounds  # Pass ROI bounds
+        roi_bounds
     )
 
     self.segmentation_thread.progress.connect(
@@ -289,8 +289,12 @@ def run_segmentation(self):
                     lines.append(f"• {name.replace('_', ' ').title()}")
                 self.organ_list.setText("\n".join(lines))
 
-            # Store ROI bounds for slice updates
+            # Store ROI bounds
             self._current_roi_bounds = roi_bounds
+
+            # APPLY ROI MASK ONCE after segmentation completes
+            if roi_bounds is not None:
+                self._apply_roi_mask_permanently(roi_bounds)
 
             self.status_bar.showMessage(
                 f"Segmentation complete! Found {len(labels)} organs")
@@ -300,6 +304,34 @@ def run_segmentation(self):
 
     self.segmentation_thread.finished.connect(_done)
     self.segmentation_thread.start()
+
+
+# ---------------------------------- ROI MASKING ----------------------------------
+def _apply_roi_mask_permanently(self, roi_bounds):
+    """
+    Apply ROI bounds to the segmentation mask ONCE (in-place modification)
+    This prevents repeated copying on every view update
+    """
+    mask = self.organ_segmentor.segmentation_mask
+
+    if mask is None:
+        return
+
+    # Get ROI bounds
+    z_start, z_end = roi_bounds.get('axial', (0, mask.shape[0]-1))
+    y_start, y_end = roi_bounds.get('coronal', (0, mask.shape[1]-1))
+    x_start, x_end = roi_bounds.get('sagittal', (0, mask.shape[2]-1))
+
+    # Zero out everything OUTSIDE the ROI (in-place)
+    mask[:z_start, :, :] = 0
+    mask[z_end+1:, :, :] = 0
+    mask[:, :y_start, :] = 0
+    mask[:, y_end+1:, :] = 0
+    mask[:, :, :x_start] = 0
+    mask[:, :, x_end+1:] = 0
+
+    print(
+        f"✓ ROI mask applied: Z[{z_start}-{z_end}] Y[{y_start}-{y_end}] X[{x_start}-{x_end}]")
 
 
 # ---------------------------------- Patch viewer (non-invasive) ----------------------------------
@@ -346,14 +378,14 @@ def _load_nifti_file_override(self):
 
 Viewer.load_nifti_file = _load_nifti_file_override
 
-# Patch update_all_views to pass ROI bounds to organ display
+# Patch update_all_views - simplified version (no more mask copying)
 Viewer._orig_update_all_views = Viewer.update_all_views
 
 
-def _update_all_views_with_roi(self):
+def _update_all_views_optimized(self):
     res = Viewer._orig_update_all_views(self)
 
-    # Update ROI status if checkbox exists
+    # Update ROI status label only
     if hasattr(self, 'roi_only_checkbox') and hasattr(self, 'roi_status_label'):
         if self.roi_only_checkbox.isChecked() and hasattr(self, 'roi_slices') and self.roi_slices:
             roi_text = (
@@ -372,7 +404,7 @@ def _update_all_views_with_roi(self):
     return res
 
 
-Viewer.update_all_views = _update_all_views_with_roi
+Viewer.update_all_views = _update_all_views_optimized
 
 # Add the new tab methods and action methods
 Viewer.create_orientation_tab = create_orientation_tab
@@ -380,6 +412,7 @@ Viewer.create_organ_segmentation_tab = create_organ_segmentation_tab
 Viewer.load_orientation_model = load_orientation_model
 Viewer.detect_orientation = detect_orientation
 Viewer.run_segmentation = run_segmentation
+Viewer._apply_roi_mask_permanently = _apply_roi_mask_permanently
 
 # Patch create_control_panel to add AI tabs
 Viewer._orig_create_control_panel = Viewer.create_control_panel
